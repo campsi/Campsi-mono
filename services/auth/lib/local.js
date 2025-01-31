@@ -4,7 +4,7 @@ const helpers = require('../../../lib/modules/responseHelpers');
 const state = require('./state');
 const bcrypt = require('bcryptjs');
 const { getUsersCollection } = require('./modules/authCollections');
-const { isEmailValid } = require('./handlers');
+const { isEmailValid, clearPasswordRateLimit, passwordRateLimitReturnAwaitImplementation } = require('./handlers');
 const editURL = require('edit-url');
 const { serviceNotAvailableRetryAfterSeconds } = require('../../../lib/modules/responseHelpers');
 const { passwordRateLimitDefaults } = require('./defaults');
@@ -98,7 +98,7 @@ const callback = async function localCallback(req, username, password, done) {
     debug('signin passport callback', username, user.identities.local.encryptedPassword, filter);
     bcrypt.compare(password, user.identities.local.encryptedPassword, function (err, isMatch) {
       if (err) {
-        debug('bcrypt password compare error', err, password, user.identities.local.encryptedPassword);
+        debug('bcrypt password compare error', err, user.identities.local.encryptedPassword);
       }
       if (isMatch) {
         user.identity = user.identities.local;
@@ -459,6 +459,8 @@ const resetPassword = async function (req, res) {
       // the request is forwarded to the passport local callback and will
       // authorize the user with the new password
       req.body.username = result.identities.local.username || result.email;
+      // reset the lock on failed password attempts
+      await handlers.clearPasswordRateLimit(req.authProvider.options?.passwordRateLimits, req);
       return handlers.callback(req, res);
     } catch (e) {
       handlers.redirectWithError(req, res, e);
@@ -480,7 +482,7 @@ const resetPassword = async function (req, res) {
  * @return {*}
  */
 const updatePassword = async function (req, res) {
-  const missingParams = getMissingParameters(req.body, ['new', 'confirm']);
+  const missingParams = getMissingParameters(req.body, ['current', 'new', 'confirm']);
   const passwordRegex = new RegExp(req.authProvider.options.passwordRegex ?? '.*');
   if (!passwordRegex.test(req.body.new)) {
     return helpers.error(
@@ -494,6 +496,32 @@ const updatePassword = async function (req, res) {
 
   if (req.body.new !== req.body.confirm) {
     return helpers.error(res, new Error('new and confirmation password do not match'));
+  }
+
+  try {
+    const isMatch = await new Promise((resolve, reject) =>
+      bcrypt.compare(req.body.current, req.user.identities.local.encryptedPassword, function (err, isMatch) {
+        if (err) {
+          debug('bcrypt password compare error', err, req.user.identities.local.encryptedPassword);
+          reject(err);
+        } else {
+          resolve(isMatch);
+        }
+      })
+    );
+    if (!isMatch) {
+      const error = new Error('current password does not match.');
+      const err = await passwordRateLimitReturnAwaitImplementation(
+        req.authProvider.options?.passwordRateLimits,
+        req,
+        res,
+        error,
+        () => error
+      );
+      return helpers.error(res, err);
+    }
+  } catch (err) {
+    return helpers.error(res, new Error('current password does not match'));
   }
 
   try {
